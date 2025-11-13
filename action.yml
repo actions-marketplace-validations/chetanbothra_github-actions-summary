@@ -6,9 +6,11 @@ inputs:
   namespace:
     description: "Kubernetes namespace"
     required: true
+
   app_name:
     description: "Kubernetes resource name (Deployment, StatefulSet, or DaemonSet)"
     required: true
+
   notify_users:
     description: "Comma separated GitHub usernames to tag in case of failure"
     required: false
@@ -21,30 +23,39 @@ outputs:
 runs:
   using: "composite"
   steps:
-    - name: Generate K8s Deployment Summary
+
+    - name: Kubernetes Deployment Summary
       shell: bash
       run: |
         set -euo pipefail
 
-        echo "🔎 Detecting resource type..."
-        RESOURCE_TYPE=""
+        NS="${{ inputs.namespace }}"
+        APP="${{ inputs.app_name }}"
+        USERS="${{ inputs.notify_users }}"
 
-        if kubectl get deploy/${{ inputs.app_name }} -n ${{ inputs.namespace }} &>/dev/null; then
+        echo "🔎 Detecting resource type..."
+
+        # Check resource existence safely
+        DEPLOY_EXISTS=$(kubectl get deploy "$APP" -n "$NS" --ignore-not-found --no-headers | wc -l)
+        STS_EXISTS=$(kubectl get statefulset "$APP" -n "$NS" --ignore-not-found --no-headers | wc -l)
+        DS_EXISTS=$(kubectl get daemonset "$APP" -n "$NS" --ignore-not-found --no-headers | wc -l)
+
+        if [ "$DEPLOY_EXISTS" -eq 1 ]; then
           RESOURCE_TYPE="deployment"
-        elif kubectl get statefulset/${{ inputs.app_name }} -n ${{ inputs.namespace }} &>/dev/null; then
+        elif [ "$STS_EXISTS" -eq 1 ]; then
           RESOURCE_TYPE="statefulset"
-        elif kubectl get daemonset/${{ inputs.app_name }} -n ${{ inputs.namespace }} &>/dev/null; then
+        elif [ "$DS_EXISTS" -eq 1 ]; then
           RESOURCE_TYPE="daemonset"
         else
-          echo "❌ No matching resource (deployment/statefulset/daemonset) found with name '${{ inputs.app_name }}' in namespace '${{ inputs.namespace }}'"
+          echo "❌ No matching resource found with name '$APP' in namespace '$NS'"
           echo "result=failure" >> $GITHUB_OUTPUT
           exit 0
         fi
 
         echo "✅ Detected resource type: $RESOURCE_TYPE"
 
-        echo "⏳ Checking rollout status for $RESOURCE_TYPE/${{ inputs.app_name }}..."
-        if ! kubectl rollout status $RESOURCE_TYPE/${{ inputs.app_name }} -n ${{ inputs.namespace }} --timeout=150s; then
+        echo "⏳ Checking rollout status..."
+        if ! kubectl rollout status $RESOURCE_TYPE/"$APP" -n "$NS" --timeout=150s; then
           RESULT="failure"
         else
           RESULT="success"
@@ -52,20 +63,23 @@ runs:
 
         echo "## 🚀 Kubernetes Deployment Summary" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
-        echo "- **Namespace:** ${{ inputs.namespace }}" >> $GITHUB_STEP_SUMMARY
-        echo "- **Resource:** $RESOURCE_TYPE/${{ inputs.app_name }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **Namespace:** $NS" >> $GITHUB_STEP_SUMMARY
+        echo "- **Resource:** $RESOURCE_TYPE/$APP" >> $GITHUB_STEP_SUMMARY
         echo "- **Triggered by:** @${GITHUB_ACTOR}" >> $GITHUB_STEP_SUMMARY
         echo "- **Commit:** ${GITHUB_SHA}" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
 
         echo "### 🔍 Pods" >> $GITHUB_STEP_SUMMARY
-        PODS_RAW="$(kubectl -n ${{ inputs.namespace }} get pods -l app=${{ inputs.app_name }} -o wide --no-headers 2>/dev/null || true)"
+
+        # Primary pod detection using app label
+        PODS_RAW=$(kubectl get pods -n "$NS" -l app="$APP" -o wide --no-headers 2>/dev/null || true)
+
         echo '```' >> $GITHUB_STEP_SUMMARY
         echo "$PODS_RAW" >> $GITHUB_STEP_SUMMARY
         echo '```' >> $GITHUB_STEP_SUMMARY
 
-        # Detect problematic pods
-        BAD_PODS="$(echo "$PODS_RAW" | awk '{split($2,r,"/"); if(r[1]<r[2] || $3 ~ /CrashLoopBackOff|Error|Evicted|ImagePullBackOff/) print $1}' || true)"
+        # Detect bad pods
+        BAD_PODS=$(echo "$PODS_RAW" | awk '{split($2,r,"/"); if(r[1]<r[2] || $3 ~ /CrashLoopBackOff|Error|Evicted|ImagePullBackOff/) print $1}' || true)
 
         if [ "$RESULT" = "failure" ] || [ -n "$BAD_PODS" ]; then
           RESULT="failure"
@@ -73,32 +87,33 @@ runs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### ⚠️ Problematic Pods Detected" >> $GITHUB_STEP_SUMMARY
 
+          # User mentions
           MENTION=""
-          for u in $(echo "${{ inputs.notify_users }}" | tr ',' ' '); do
+          for u in $(echo "$USERS" | tr ',' ' '); do
             MENTION="$MENTION @$u"
           done
-
           if [ -n "$MENTION" ]; then
             echo "- Notifying: $MENTION" >> $GITHUB_STEP_SUMMARY
           fi
 
+          # Print details for each bad pod
           for p in $BAD_PODS; do
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "#### ❌ Pod: $p" >> $GITHUB_STEP_SUMMARY
 
             echo '```' >> $GITHUB_STEP_SUMMARY
-            kubectl -n ${{ inputs.namespace }} describe pod "$p" || true
+            kubectl describe pod "$p" -n "$NS" || true
             echo '```' >> $GITHUB_STEP_SUMMARY
 
             echo '```' >> $GITHUB_STEP_SUMMARY
-            kubectl -n ${{ inputs.namespace }} logs "$p" --all-containers --tail=200 || true
+            kubectl logs "$p" -n "$NS" --all-containers --tail=200 || true
             echo '```' >> $GITHUB_STEP_SUMMARY
           done
 
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 🕑 Recent Namespace Events" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          kubectl -n ${{ inputs.namespace }} get events --sort-by='.metadata.creationTimestamp' | tail -n 50 || true
+          kubectl get events -n "$NS" --sort-by=.metadata.creationTimestamp | tail -n 50 || true
           echo '```' >> $GITHUB_STEP_SUMMARY
         else
           echo "" >> $GITHUB_STEP_SUMMARY
