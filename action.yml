@@ -30,15 +30,11 @@ runs:
 
         echo "🔎 Detecting resource type..."
 
-        DEP=$(kubectl get deploy "$APP" -n "$NS" --ignore-not-found --no-headers | wc -l)
-        STS=$(kubectl get statefulset "$APP" -n "$NS" --ignore-not-found --no-headers | wc -l)
-        DS=$(kubectl get daemonset "$APP" -n "$NS" --ignore-not-found --no-headers | wc -l)
-
-        if [ "$DEP" -eq 1 ]; then
+        if kubectl get deploy "$APP" -n "$NS" --ignore-not-found --no-headers | grep -q .; then
           RESOURCE_TYPE="deployment"
-        elif [ "$STS" -eq 1 ]; then
+        elif kubectl get statefulset "$APP" -n "$NS" --ignore-not-found --no-headers | grep -q .; then
           RESOURCE_TYPE="statefulset"
-        elif [ "$DS" -eq 1 ]; then
+        elif kubectl get daemonset "$APP" -n "$NS" --ignore-not-found --no-headers | grep -q .; then
           RESOURCE_TYPE="daemonset"
         else
           echo "❌ Resource '$APP' not found in '$NS'"
@@ -46,19 +42,14 @@ runs:
           exit 0
         fi
 
-        echo "⏳ Checking rollout status for $RESOURCE_TYPE/$APP ..."
+        echo "⏳ Checking rollout status..."
         if kubectl rollout status $RESOURCE_TYPE/"$APP" -n "$NS" --timeout=120s; then
           RESULT="success"
         else
           RESULT="failure"
         fi
 
-        # Identify pods managed by this workload
-        PODS_RAW=$(kubectl get pods -n "$NS" -l app="$APP" \
-            -o=custom-columns=NAME:.metadata.name,READY:.status.containerStatuses[*].ready,STATE:.status.phase,RESTARTS:.status.containerStatuses[*].restartCount,NODE:.spec.nodeName --no-headers || true)
-
         echo "## 🚀 Kubernetes Deployment Summary" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
         echo "- **Namespace:** $NS" >> $GITHUB_STEP_SUMMARY
         echo "- **Resource:** $RESOURCE_TYPE/$APP" >> $GITHUB_STEP_SUMMARY
         echo "- **Triggered by:** @${GITHUB_ACTOR}" >> $GITHUB_STEP_SUMMARY
@@ -66,30 +57,75 @@ runs:
 
         echo "### 🔍 Pods" >> $GITHUB_STEP_SUMMARY
         echo '```' >> $GITHUB_STEP_SUMMARY
-        echo "$PODS_RAW" >> $GITHUB_STEP_SUMMARY
+
+        PODS_JSON=$(kubectl get pods -n "$NS" -l app="$APP" -o json)
+
+        echo "$PODS_JSON" | jq -r '
+          .items[] |
+          . as $pod |
+          (
+            ($pod.status.containerStatuses // []) |
+            map(.ready) |
+            map(select(. == true)) |
+            length
+          ) as $ready
+          |
+          (
+            ($pod.status.containerStatuses // []) |
+            length
+          ) as $total
+          |
+          (
+            if ($pod.status.containerStatuses[0].state.waiting.reason) then
+              $pod.status.containerStatuses[0].state.waiting.reason
+            elif ($pod.status.containerStatuses[0].state.terminated.reason) then
+              $pod.status.containerStatuses[0].state.terminated.reason
+            else
+              $pod.status.phase
+            end
+          ) as $status
+          |
+          (
+            ($pod.status.containerStatuses // []) |
+            map(.restartCount // 0) |
+            add
+          ) as $restarts
+          |
+          (
+            (now - (.metadata.creationTimestamp | fromdate)) / 60 | floor | tostring + "m"
+          ) as $age
+          |
+          "\($pod.metadata.name)   \($ready)/\($total)   \($status)   \($restarts)   \($age)   \($pod.spec.nodeName)"
+        ' >> $GITHUB_STEP_SUMMARY
+
         echo '```' >> $GITHUB_STEP_SUMMARY
 
-        # Detect bad pods: RestartCount > 0 OR CrashLoopBackOff OR Error
-        BAD_PODS=$(kubectl get pods -n "$NS" -l app="$APP" \
-            -o json | jq -r '.items[] | select(
-                (.status.containerStatuses[]?.restartCount // 0) > 0 or
-                (.status.containerStatuses[]?.state.waiting.reason == "CrashLoopBackOff") or
-                (.status.containerStatuses[]?.state.waiting.reason == "Error")
-            ) | .metadata.name')
+        # Detect failing pods
+        BAD_PODS=$(echo "$PODS_JSON" | jq -r '
+          .items[]
+          | select(
+              (.status.containerStatuses[]?.state.waiting.reason == "CrashLoopBackOff")
+              or (.status.containerStatuses[]?.state.waiting.reason == "Error")
+              or ((.status.containerStatuses[]?.restartCount // 0) > 3)
+          )
+          | .metadata.name
+        ')
 
         if [ -n "$BAD_PODS" ]; then
           RESULT="failure"
-
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### ⚠️ Problematic Pods Detected" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
 
+          # Mentions
           if [ -n "$USERS" ]; then
-            echo "- Notifying: $(echo "$USERS" | sed 's/,/ @/g' | sed 's/^/@/')" >> $GITHUB_STEP_SUMMARY
+            M="@${USERS//,/ @}"
+            echo "- Notifying: $M" >> $GITHUB_STEP_SUMMARY
           fi
 
           for P in $BAD_PODS; do
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "#### ❌ Pod: $P" >> $GITHUB_STEP_SUMMARY
+            echo "#### ❌ $P" >> $GITHUB_STEP_SUMMARY
 
             echo '```' >> $GITHUB_STEP_SUMMARY
             kubectl describe pod "$P" -n "$NS" || true
@@ -104,7 +140,7 @@ runs:
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "### 🕑 Recent Namespace Events" >> $GITHUB_STEP_SUMMARY
         echo '```' >> $GITHUB_STEP_SUMMARY
-        kubectl get events -n "$NS" --sort-by=.metadata.creationTimestamp | tail -n 50 || true
+        kubectl get events -n "$NS" --sort-by='.metadata.creationTimestamp' | tail -50 || true
         echo '```' >> $GITHUB_STEP_SUMMARY
 
         echo "result=$RESULT" >> $GITHUB_OUTPUT
