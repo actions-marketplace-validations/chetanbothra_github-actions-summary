@@ -35,7 +35,6 @@ runs:
 
         echo "🔎 Detecting resource type..."
 
-        # Check resource existence safely
         DEPLOY_EXISTS=$(kubectl get deploy "$APP" -n "$NS" --ignore-not-found --no-headers | wc -l)
         STS_EXISTS=$(kubectl get statefulset "$APP" -n "$NS" --ignore-not-found --no-headers | wc -l)
         DS_EXISTS=$(kubectl get daemonset "$APP" -n "$NS" --ignore-not-found --no-headers | wc -l)
@@ -61,6 +60,35 @@ runs:
           RESULT="success"
         fi
 
+        ######################################################################
+        # 🆕 NEW: WAIT FOR NEW PODS TO APPEAR BEFORE LOG COLLECTION
+        ######################################################################
+        echo "⏳ Waiting for new pods to appear..."
+
+        # Detect the new pod template hash
+        NEW_HASH=$(kubectl get $RESOURCE_TYPE "$APP" -n "$NS" -o jsonpath='{.spec.template.metadata.labels.pod-template-hash}')
+
+        echo "📌 New pod-template-hash: $NEW_HASH"
+
+        # Wait for pods with new hash to be Running
+        for i in {1..30}; do
+          NEW_READY=$(kubectl get pods -n "$NS" -l app="$APP",pod-template-hash="$NEW_HASH" \
+            -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.phase}{"\n"}{end}' | grep Running || true)
+
+          if [ -n "$NEW_READY" ]; then
+            echo "✅ New pod is Running:"
+            echo "$NEW_READY"
+            break
+          fi
+
+          echo "⏳ New pod not ready yet... waiting 5s"
+          sleep 5
+        done
+
+        ######################################################################
+        # END OF NEW BLOCK
+        ######################################################################
+
         echo "## 🚀 Kubernetes Deployment Summary" >> $GITHUB_STEP_SUMMARY
         echo "" >> $GITHUB_STEP_SUMMARY
         echo "- **Namespace:** $NS" >> $GITHUB_STEP_SUMMARY
@@ -71,14 +99,12 @@ runs:
 
         echo "### 🔍 Pods" >> $GITHUB_STEP_SUMMARY
 
-        # Primary pod detection using app label
         PODS_RAW=$(kubectl get pods -n "$NS" -l app="$APP" -o wide --no-headers 2>/dev/null || true)
 
         echo '```' >> $GITHUB_STEP_SUMMARY
         echo "$PODS_RAW" >> $GITHUB_STEP_SUMMARY
         echo '```' >> $GITHUB_STEP_SUMMARY
 
-        # Detect bad pods
         BAD_PODS=$(echo "$PODS_RAW" | awk '{split($2,r,"/"); if(r[1]<r[2] || $3 ~ /CrashLoopBackOff|Error|Evicted|ImagePullBackOff/) print $1}' || true)
 
         if [ "$RESULT" = "failure" ] || [ -n "$BAD_PODS" ]; then
@@ -87,7 +113,6 @@ runs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### ⚠️ Problematic Pods Detected" >> $GITHUB_STEP_SUMMARY
 
-          # User mentions
           MENTION=""
           for u in $(echo "$USERS" | tr ',' ' '); do
             MENTION="$MENTION @$u"
@@ -96,7 +121,6 @@ runs:
             echo "- Notifying: $MENTION" >> $GITHUB_STEP_SUMMARY
           fi
 
-          # Print details for each bad pod
           for p in $BAD_PODS; do
             echo "" >> $GITHUB_STEP_SUMMARY
             echo "#### ❌ Pod: $p" >> $GITHUB_STEP_SUMMARY
