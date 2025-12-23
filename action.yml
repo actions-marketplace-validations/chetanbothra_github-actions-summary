@@ -18,11 +18,10 @@ outputs:
 runs:
   using: "composite"
   steps:
-
     - name: Kubernetes Deployment Summary
       shell: bash
       run: |
-        set -euo pipefail
+        set -eo pipefail
 
         NS="${{ inputs.namespace }}"
         APP="${{ inputs.app_name }}"
@@ -30,87 +29,64 @@ runs:
 
         echo "🔎 Detecting resource type..."
 
-        if kubectl get deploy "$APP" -n "$NS" --ignore-not-found --no-headers | grep -q .; then
+        if kubectl get deploy "$APP" -n "$NS" >/dev/null 2>&1; then
           RESOURCE_TYPE="deployment"
-        elif kubectl get statefulset "$APP" -n "$NS" --ignore-not-found --no-headers | grep -q .; then
+        elif kubectl get statefulset "$APP" -n "$NS" >/dev/null 2>&1; then
           RESOURCE_TYPE="statefulset"
-        elif kubectl get daemonset "$APP" -n "$NS" --ignore-not-found --no-headers | grep -q .; then
+        elif kubectl get daemonset "$APP" -n "$NS" >/dev/null 2>&1; then
           RESOURCE_TYPE="daemonset"
         else
-          echo "❌ Resource '$APP' not found in '$NS'"
-          echo "result=failure" >> $GITHUB_OUTPUT
+          echo "❌ Resource '$APP' not found"
+          echo "result=failure" >> "$GITHUB_OUTPUT"
           exit 1
         fi
 
-        echo "⏳ Checking rollout status..."
-
-        ROLLOUT_OK=true
-        if ! kubectl rollout status $RESOURCE_TYPE/"$APP" -n "$NS" --timeout=120s; then
+        echo "⏳ Waiting for rollout to complete..."
+        if ! kubectl rollout status "$RESOURCE_TYPE/$APP" -n "$NS" --timeout=5m; then
           ROLLOUT_OK=false
+        else
+          ROLLOUT_OK=true
         fi
 
-        echo "## 🚀 Kubernetes Deployment Summary" >> $GITHUB_STEP_SUMMARY
-        echo "- **Namespace:** $NS" >> $GITHUB_STEP_SUMMARY
-        echo "- **Resource:** $RESOURCE_TYPE/$APP" >> $GITHUB_STEP_SUMMARY
-        echo "- **Triggered by:** @${GITHUB_ACTOR}" >> $GITHUB_STEP_SUMMARY
-        echo "" >> $GITHUB_STEP_SUMMARY
-
-        echo "### 🔍 Pods" >> $GITHUB_STEP_SUMMARY
-        echo '```' >> $GITHUB_STEP_SUMMARY
-
+        # Fetch pods AFTER rollout
         PODS_JSON=$(kubectl get pods -n "$NS" -l app="$APP" -o json)
+
+        echo "## 🚀 Kubernetes Deployment Summary" >> "$GITHUB_STEP_SUMMARY"
+        echo "- **Namespace:** $NS" >> "$GITHUB_STEP_SUMMARY"
+        echo "- **Resource:** $RESOURCE_TYPE/$APP" >> "$GITHUB_STEP_SUMMARY"
+        echo "- **Triggered by:** @${GITHUB_ACTOR}" >> "$GITHUB_STEP_SUMMARY"
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+
+        echo "### 🔍 Pods" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
 
         echo "$PODS_JSON" | jq -r '
           .items[] |
-          . as $pod |
+          .metadata.name as $name |
+          .status.phase as $phase |
           (
-            ($pod.status.containerStatuses // []) |
-            map(.ready) |
-            map(select(. == true)) |
-            length
-          ) as $ready
-          |
+            [.status.containerStatuses[]?.ready] | map(select(.==true)) | length
+          ) as $ready |
           (
-            ($pod.status.containerStatuses // []) |
-            length
-          ) as $total
-          |
+            [.status.containerStatuses[]?] | length
+          ) as $total |
           (
-            if ($pod.status.containerStatuses[0].state.waiting.reason) then
-              $pod.status.containerStatuses[0].state.waiting.reason
-            elif ($pod.status.containerStatuses[0].state.terminated.reason) then
-              $pod.status.containerStatuses[0].state.terminated.reason
-            else
-              $pod.status.phase
-            end
-          ) as $status
-          |
-          (
-            ($pod.status.containerStatuses // []) |
-            map(.restartCount // 0) |
-            add
-          ) as $restarts
-          |
-          (
-            (now - (.metadata.creationTimestamp | fromdate)) / 60 | floor | tostring + "m"
-          ) as $age
-          |
-          "\($pod.metadata.name)   \($ready)/\($total)   \($status)   \($restarts)   \($age)   \($pod.spec.nodeName)"
-        ' >> $GITHUB_STEP_SUMMARY
+            [.status.containerStatuses[]?.restartCount] | add // 0
+          ) as $restarts |
+          "\($name)   \($ready)/\($total)   \($phase)   \($restarts)"
+        ' >> "$GITHUB_STEP_SUMMARY"
 
-        echo '```' >> $GITHUB_STEP_SUMMARY
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-        echo ""
-        echo "### 🔎 Checking for problematic pods..." >> $GITHUB_STEP_SUMMARY
+        echo "### ⚠️ Checking for real failures..." >> "$GITHUB_STEP_SUMMARY"
 
         BAD_PODS=$(echo "$PODS_JSON" | jq -r '
           .items[]
           | select(
-              (.status.containerStatuses[]?.state.waiting.reason == "CrashLoopBackOff")
-              or (.status.containerStatuses[]?.state.waiting.reason == "Error")
+              (.status.phase == "Failed")
+              or (.status.containerStatuses[]?.state.waiting.reason == "CrashLoopBackOff")
               or (.status.containerStatuses[]?.state.waiting.reason == "CreateContainerConfigError")
-              or (.status.containerStatuses[]?.state.waiting.reason == "ImagePullBackOff")
-              or ((.status.containerStatuses[]?.restartCount // 0) > 3)
+              or (.status.containerStatuses[]?.state.waiting.reason == "InvalidImageName")
           )
           | .metadata.name
         ')
@@ -119,39 +95,33 @@ runs:
 
         if [ -n "$BAD_PODS" ]; then
           FAILURE=true
-
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### ⚠️ Problematic Pods Detected" >> $GITHUB_STEP_SUMMARY
-
-          if [ -n "$USERS" ]; then
-            M="@${USERS//,/ @}"
-            echo "- Notifying: $M" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### ❌ Problematic Pods" >> "$GITHUB_STEP_SUMMARY"
 
           for P in $BAD_PODS; do
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "#### ❌ $P" >> $GITHUB_STEP_SUMMARY
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "#### $P" >> "$GITHUB_STEP_SUMMARY"
 
-            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
             kubectl describe pod "$P" -n "$NS" || true
-            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
             kubectl logs "$P" -n "$NS" --all-containers --tail=200 || true
-            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
           done
         fi
 
-        echo "" >> $GITHUB_STEP_SUMMARY
-        echo "### 🕑 Recent Namespace Events" >> $GITHUB_STEP_SUMMARY
-        echo '```' >> $GITHUB_STEP_SUMMARY
-        kubectl get events -n "$NS" --sort-by='.metadata.creationTimestamp' | tail -50 || true
-        echo '```' >> $GITHUB_STEP_SUMMARY
+        echo "" >> "$GITHUB_STEP_SUMMARY"
+        echo "### 🕑 Recent Events" >> "$GITHUB_STEP_SUMMARY"
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
+        kubectl get events -n "$NS" --sort-by='.metadata.creationTimestamp' | tail -30 || true
+        echo '```' >> "$GITHUB_STEP_SUMMARY"
 
-        # FINAL RESULT
         if [ "$ROLLOUT_OK" = false ] || [ "$FAILURE" = true ]; then
-          echo "result=failure" >> $GITHUB_OUTPUT
+          echo "result=failure" >> "$GITHUB_OUTPUT"
           exit 1
         fi
 
-        echo "result=success" >> $GITHUB_OUTPUT
+        echo "result=success" >> "$GITHUB_OUTPUT"
+
